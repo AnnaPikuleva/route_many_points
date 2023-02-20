@@ -1,0 +1,109 @@
+CREATE OR REPLACE FUNCTION "public"."__asp_get_route_cars_many_points"("id" float8, "geom" "public"."geometry")
+  RETURNS TABLE("export" int4) AS $BODY$
+
+BEGIN
+
+DROP TABLE IF EXISTS routeinput;  
+CREATE UNLOGGED TABLE routeinput AS
+select
+    src.geom
+-- #osm_buildings - таблица с адресами домов  (координаты домов)  
+from osm_buildings as src
+limit 25
+;
+
+DROP TABLE IF EXISTS routesrc;
+CREATE UNLOGGED TABLE routesrc AS
+SELECT
+    id,
+    source,
+--     #идетификатор конечного узла сегмента для роутинга
+    target,
+--     #длина сегмента
+    shape_length as cost,
+    shape_length as reverse_cost
+-- #osm_network - таблица с ребрами маршрутного графа (streets_auto_vertices_pgr_tosh)
+-- #routeinput - взятая геметрия дорожного сегмента
+FROM streets_auto_tosh, 
+(select st_collect(geom) as the_geom from routeinput) as t 
+WHERE ST_DWithin(streets_auto_tosh.geom, t.geom,5e-3) and streets_auto_tosh.ar_auto_bool = t
+;
+
+
+DROP TABLE IF EXISTS route;
+CREATE UNLOGGED TABLE route as
+with route_order as (
+SELECT * FROM pgr_TSP(
+    $$
+    --SELECT * FROM pgr_dijkstraSymmetrizeCostMatrix(
+    --    $_$
+    --    SELECT * FROM pgr_dijkstraValidateCostMatrix(
+    --        $__$
+            SELECT * FROM pgr_dijkstraCostMatrix(
+                $___$
+                    SELECT id,source,target,cost,reverse_cost FROM routesrc
+                $___$,
+                (select array_agg(id)
+                    from (
+                        select n.id
+                        from streets_auto_vertices_pgr_tosh as n, routeinput as src
+                        where n.the_geom && src.the_geom
+                        --and exists (select 1 from x where the_geom && n.the_geom)
+                    ) as t
+                ),
+                directed := false
+            )
+    --        $__$
+    --    )
+    --    $_$
+    --)
+    $$,
+    randomize := false
+)
+),
+route as (
+    SELECT
+        seq,path_id,path_seq,start_vid,end_vid,node,CASE WHEN end_vid=node THEN NULL ELSE edge END as edge,cost,agg_cost,route_agg_cost
+    FROM pgr_dijkstraVia(
+        'SELECT * FROM routesrc',
+        (select array_agg(node order by seq) from route_order),
+        directed := true
+    )
+),
+edges as (
+    select
+        path_id as seq,
+        start_vid as node,
+        round(sum(st_length(the_geom::geography))) as length,
+        st_union(the_geom) as route
+    from route as r, streets_auto_tosh as n
+    where r.edge=n.id
+    group by 1, 2
+),
+export as (
+    select
+        src.the_geom as geom_point,
+        r.route,
+        COALESCE(length,0) as length,
+        COALESCE(r.seq,0) as sequence,
+        CASE WHEN r.node IS NULL THEN 'fail' ELSE 'ok' END as status
+				
+-- 				geom_point geometry
+				
+				
+    from routeinput as src
+    left join streets_auto_vertices_pgr_tosh as n on n.the_geom && src.the_geom
+    left join edges as r on r.node=n.id
+    order by r.seq
+)
+select * from export
+;
+	
+	
+
+END;
+
+$BODY$
+  LANGUAGE plpgsql VOLATILE
+  COST 100
+  ROWS 1
